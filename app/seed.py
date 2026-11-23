@@ -3,12 +3,64 @@ from __future__ import annotations
 import json
 
 from app.db import _meta_get, _meta_set, ensure_db, get_db
+from app.services.cutover import MODE_LABEL, fingerprint
+
+
+def _ensure_cutover_backfill(conn) -> int:
+    """存量库兜底：为无落点的中心按当前生效方案补初始切流落点（仅一次）。"""
+    if _meta_get(conn, "cutover_seeded") == "1":
+        return 0
+    conn.execute(
+        "INSERT OR IGNORE INTO app_settings(key, value, label) VALUES (?,?,?)",
+        ("protocol_cutover_mode", MODE_LABEL, "协议切流口径（只读）"),
+    )
+    active = conn.execute(
+        "SELECT * FROM protocols WHERE status='生效' ORDER BY id LIMIT 1"
+    ).fetchone()
+    filled = 0
+    if active:
+        fields = [str(x) for x in json.loads(active["required_fields"] or "[]")]
+        visits = [str(x) for x in json.loads(active["visit_codes"] or "[]")]
+        fp = fingerprint(active["protocol_code"], active["version"], fields, visits)
+        missing = conn.execute(
+            """
+            SELECT s.id FROM trial_sites s
+            WHERE NOT EXISTS (
+              SELECT 1 FROM protocol_cutovers c
+              WHERE c.site_id=s.id AND c.status='现行'
+            )
+            """
+        ).fetchall()
+        for row in missing:
+            conn.execute(
+                """
+                INSERT INTO protocol_cutovers(
+                  site_id, protocol_id, protocol_code, protocol_version,
+                  required_fields, visit_codes, fingerprint, revision, status, note
+                ) VALUES (?,?,?,?,?,?,?,?, '现行', ?)
+                """,
+                (
+                    row["id"],
+                    active["id"],
+                    active["protocol_code"],
+                    active["version"],
+                    json.dumps(fields, ensure_ascii=False),
+                    json.dumps(visits, ensure_ascii=False),
+                    fp,
+                    1,
+                    "初始落点（随生效方案回填）",
+                ),
+            )
+            filled += 1
+    _meta_set(conn, "cutover_seeded", "1")
+    return filled
 
 
 def seed_if_needed(db_path: str | None = None) -> None:
     ensure_db()
     with get_db(db_path) as conn:
         if _meta_get(conn, "seeded") == "1":
+            _ensure_cutover_backfill(conn)
             return
 
         settings = [
@@ -20,6 +72,7 @@ def seed_if_needed(db_path: str | None = None) -> None:
             ("default_visit_codes", "V1,V2,V3,EOT", "默认访视编码清单"),
             ("crawl_page_size", "20", "模拟抓取每批条数"),
             ("clinic_timezone", "Asia/Shanghai", "台账时区"),
+            ("protocol_cutover_mode", MODE_LABEL, "协议切流口径（只读）"),
         ]
         conn.executemany(
             "INSERT OR IGNORE INTO app_settings(key, value, label) VALUES (?,?,?)",
@@ -91,6 +144,32 @@ def seed_if_needed(db_path: str | None = None) -> None:
                 ),
             )
             protocol_ids.append(cur.lastrowid)
+
+        # 协议切流初始落点：四个种子中心全部钉到当前生效方案（甲·快照表）
+        live_proto = protocols[0]
+        live_fields = live_proto[4]
+        live_visits = live_proto[5]
+        live_fp = fingerprint(live_proto[0], live_proto[1], live_fields, live_visits)
+        for sid in site_ids:
+            conn.execute(
+                """
+                INSERT INTO protocol_cutovers(
+                  site_id, protocol_id, protocol_code, protocol_version,
+                  required_fields, visit_codes, fingerprint, revision, status, note
+                ) VALUES (?,?,?,?,?,?,?,?, '现行', ?)
+                """,
+                (
+                    sid,
+                    protocol_ids[0],
+                    live_proto[0],
+                    live_proto[1],
+                    json.dumps(live_fields, ensure_ascii=False),
+                    json.dumps(live_visits, ensure_ascii=False),
+                    live_fp,
+                    1,
+                    "初始落点（随生效方案回填）",
+                ),
+            )
 
         batches = [
             ("VB-SITE-001-SEED-01", site_ids[0], protocol_ids[0], "已收齐", "华东首轮访视抓取"),
@@ -221,4 +300,5 @@ def seed_if_needed(db_path: str | None = None) -> None:
             """
         )
         _meta_set(conn, "seeded", "1")
-        _meta_set(conn, "seed_version", "clinic-1")
+        _meta_set(conn, "seed_version", "clinic-2")
+        _meta_set(conn, "cutover_seeded", "1")

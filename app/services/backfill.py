@@ -5,6 +5,7 @@ from datetime import datetime
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import cutover as cutover_svc
 from app.services import settings as settings_svc
 from app.services.errors import ServiceError
 
@@ -77,6 +78,8 @@ def enqueue_from_row(row_id: int, db_path: str | None = None) -> dict:
         ).fetchone()
         if not batch or batch["status"] == "已关闭":
             raise ServiceError("已关闭批次不能排队补采")
+        # 切流闸：拦截错版行进入补采
+        cutover_svc.gate_batch_conn(conn, batch)
         if row["quality"] == "合格" and row["status"] == "已入库":
             raise ServiceError("已入库合格行无需补采")
         pending = conn.execute(
@@ -180,6 +183,12 @@ def run_job(job_id: int, succeed: bool = True, db_path: str | None = None) -> di
                 (job_id,),
             )
             return get_job(job_id, db_path)
+        # 切流闸：补采执行前再核落点，防止吃进错版行
+        batch = conn.execute(
+            "SELECT * FROM visit_batches WHERE id=?", (row["batch_id"],)
+        ).fetchone()
+        if batch:
+            cutover_svc.gate_batch_conn(conn, batch)
         if succeed:
             payload = row["payload"]
             try:

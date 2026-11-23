@@ -2,9 +2,22 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import cutover as cutover_svc
 from app.services.errors import ServiceError
 
 VALID_STATUS = ("启用", "停用", "观察")
+
+_LIVE_CUTOVER_JOIN = """
+  LEFT JOIN protocol_cutovers c
+    ON c.site_id=s.id AND c.status='现行'
+"""
+_LIVE_CUTOVER_COLS = """,
+  c.id AS cutover_id,
+  c.protocol_id AS cutover_protocol_id,
+  c.protocol_code AS cutover_code,
+  c.protocol_version AS cutover_version,
+  c.fingerprint AS cutover_fingerprint,
+  c.revision AS cutover_revision"""
 
 
 def list_sites(db_path: str | None = None, status: str | None = None) -> list[dict]:
@@ -17,7 +30,9 @@ def list_sites(db_path: str | None = None, status: str | None = None) -> list[di
                 SELECT s.*,
                   (SELECT COUNT(*) FROM visit_batches b WHERE b.site_id=s.id) AS batch_count,
                   (SELECT COALESCE(SUM(b.gap_count),0) FROM visit_batches b WHERE b.site_id=s.id) AS gap_total
+                  """ + _LIVE_CUTOVER_COLS + """
                 FROM trial_sites s
+                """ + _LIVE_CUTOVER_JOIN + """
                 WHERE s.status=?
                 ORDER BY s.id
                 """,
@@ -29,7 +44,9 @@ def list_sites(db_path: str | None = None, status: str | None = None) -> list[di
                 SELECT s.*,
                   (SELECT COUNT(*) FROM visit_batches b WHERE b.site_id=s.id) AS batch_count,
                   (SELECT COALESCE(SUM(b.gap_count),0) FROM visit_batches b WHERE b.site_id=s.id) AS gap_total
+                  """ + _LIVE_CUTOVER_COLS + """
                 FROM trial_sites s
+                """ + _LIVE_CUTOVER_JOIN + """
                 ORDER BY s.id
                 """
             ).fetchall()
@@ -38,7 +55,13 @@ def list_sites(db_path: str | None = None, status: str | None = None) -> list[di
 
 def get_site(site_id: int, db_path: str | None = None) -> dict:
     with get_db(db_path) as conn:
-        row = conn.execute("SELECT * FROM trial_sites WHERE id=?", (site_id,)).fetchone()
+        row = conn.execute(
+            "SELECT s.*" + _LIVE_CUTOVER_COLS + """
+            FROM trial_sites s
+            """ + _LIVE_CUTOVER_JOIN + """
+            WHERE s.id=?""",
+            (site_id,),
+        ).fetchone()
         if not row:
             raise ServiceError("试验中心不存在", 404)
         batches = conn.execute(
@@ -99,6 +122,15 @@ def create_site(
         )
         site_id = cur.lastrowid
     audit_svc.write_event("创建试验中心", "trial_site", site_id, name, db_path=db_path)
+    # 初始落点：有生效方案即按切流闸钉到该中心；无生效方案则留待显式切流
+    with get_db(db_path) as conn:
+        active = conn.execute(
+            "SELECT id FROM protocols WHERE status='生效' ORDER BY id LIMIT 1"
+        ).fetchone()
+    if active:
+        cutover_svc.submit_cutover(
+            site_id, active["id"], 0, note="登记中心自动落点", db_path=db_path
+        )
     return get_site(site_id, db_path)
 
 

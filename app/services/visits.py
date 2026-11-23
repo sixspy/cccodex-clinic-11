@@ -6,12 +6,33 @@ from datetime import datetime
 
 from app.db import get_db
 from app.services import audit as audit_svc
-from app.services import protocols as protocols_svc
+from app.services import cutover as cutover_svc
 from app.services.errors import ServiceError
 
 BATCH_STATUS = ("采集中", "已收齐", "已关闭")
 ROW_QUALITY = ("合格", "缺字段", "编码空", "重复键")
 ROW_STATUS = ("待检", "已入库", "待补采", "已关闭")
+
+_BATCH_CUTOVER_COLS = """,
+  c.protocol_id AS cutover_protocol_id,
+  c.protocol_code AS cutover_code,
+  c.protocol_version AS cutover_version,
+  c.fingerprint AS cutover_fingerprint,
+  c.revision AS cutover_revision"""
+_BATCH_CUTOVER_JOIN = """
+  LEFT JOIN protocol_cutovers c
+    ON c.site_id=b.site_id AND c.status='现行'"""
+
+
+def _cutover_state(item: dict) -> dict:
+    """切流对照：批次版号 vs 中心现行落点。"""
+    if not item.get("cutover_protocol_id"):
+        item["cutover_state"] = "无落点"
+    elif item.get("protocol_id") != item.get("cutover_protocol_id"):
+        item["cutover_state"] = "拧花"
+    else:
+        item["cutover_state"] = "一致"
+    return item
 
 
 def _refresh_batch_counts(conn, batch_id: int) -> None:
@@ -52,26 +73,30 @@ def list_batches(
             f"""
             SELECT b.*, s.name AS site_name, s.site_code,
                    p.protocol_code, p.version AS protocol_version
+                   {_BATCH_CUTOVER_COLS}
             FROM visit_batches b
             JOIN trial_sites s ON s.id=b.site_id
             LEFT JOIN protocols p ON p.id=b.protocol_id
+            {_BATCH_CUTOVER_JOIN}
             {where}
             ORDER BY b.id DESC
             """,
             params,
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_cutover_state(dict(r)) for r in rows]
 
 
 def get_batch(batch_id: int, db_path: str | None = None) -> dict:
     with get_db(db_path) as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT b.*, s.name AS site_name, s.site_code, s.status AS site_status,
                    p.protocol_code, p.version AS protocol_version, p.title AS protocol_title
+                   {_BATCH_CUTOVER_COLS}
             FROM visit_batches b
             JOIN trial_sites s ON s.id=b.site_id
             LEFT JOIN protocols p ON p.id=b.protocol_id
+            {_BATCH_CUTOVER_JOIN}
             WHERE b.id=?
             """,
             (batch_id,),
@@ -97,7 +122,7 @@ def get_batch(batch_id: int, db_path: str | None = None) -> dict:
         data = dict(row)
         data["items"] = [dict(i) for i in items]
         data["quality_stats"] = {r["quality"]: r["c"] for r in quality_stats}
-        return data
+        return _cutover_state(data)
 
 
 def create_batch(
@@ -126,18 +151,14 @@ def create_batch(
         ).fetchone()["c"]
         if active >= 3:
             raise ServiceError("同一中心采集中批次不能超过 3 个")
-        pid = protocol_id
-        if pid:
-            proto = conn.execute(
-                "SELECT * FROM protocols WHERE id=?", (pid,)
-            ).fetchone()
-            if not proto:
-                raise ServiceError("方案版本不存在", 404)
-            if proto["status"] != "生效":
-                raise ServiceError("只能挂接生效方案")
-        else:
-            active_proto = protocols_svc.active_protocol(db_path)
-            pid = active_proto["id"] if active_proto else None
+        # 读侧只读切流快照表：开批必须挂现行落点方案，拒回刷
+        cutover = cutover_svc.gate_current_conn(conn, site_id)
+        pid = cutover["protocol_id"]
+        if protocol_id and int(protocol_id) != pid:
+            raise ServiceError(
+                f"切流闸：该中心现行落点 {cutover['protocol_code']}@"
+                f"{cutover['protocol_version']}，不能挂接其他方案"
+            )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         code = f"VB-{site['site_code']}-{stamp}"
         cur = conn.execute(
@@ -199,25 +220,20 @@ def add_visit_row(
             raise ServiceError("访视批次不存在", 404)
         if batch["status"] == "已关闭":
             raise ServiceError("已关闭批次不能追加访视行")
+        # 切流闸：无落点 / 拧花 / 印记坏一律拦截；必填字段只读落点快照
+        cutover = cutover_svc.gate_batch_conn(conn, batch)
+        required = cutover_svc._parse_list(cutover["required_fields"]) or [
+            "subject_key",
+            "visit_code",
+            "visit_date",
+            "investigator",
+        ]
         site = conn.execute(
             "SELECT * FROM trial_sites WHERE id=?", (batch["site_id"],)
         ).fetchone()
         if site and site["quota"] > 0:
             if batch["item_count"] >= site["quota"]:
                 raise ServiceError("已达中心配额上限，不能再追加")
-        required = ["subject_key", "visit_code", "visit_date", "investigator"]
-        if batch["protocol_id"]:
-            proto = conn.execute(
-                "SELECT required_fields FROM protocols WHERE id=?",
-                (batch["protocol_id"],),
-            ).fetchone()
-            if proto:
-                try:
-                    parsed = json.loads(proto["required_fields"] or "[]")
-                    if isinstance(parsed, list) and parsed:
-                        required = [str(x) for x in parsed]
-                except json.JSONDecodeError:
-                    pass
         dup = conn.execute(
             """
             SELECT id FROM visit_rows
@@ -286,19 +302,14 @@ def mock_crawl(
             raise ServiceError("访视批次不存在", 404)
         if batch["status"] == "已关闭":
             raise ServiceError("已关闭批次不能模拟抓取")
-        visit_codes = ["V1", "V2", "V3", "EOT"]
-        if batch["protocol_id"]:
-            proto = conn.execute(
-                "SELECT visit_codes FROM protocols WHERE id=?",
-                (batch["protocol_id"],),
-            ).fetchone()
-            if proto:
-                try:
-                    parsed = json.loads(proto["visit_codes"] or "[]")
-                    if isinstance(parsed, list) and parsed:
-                        visit_codes = [str(x) for x in parsed]
-                except json.JSONDecodeError:
-                    pass
+        # 切流闸：拦截旧协议抓取；访视编码只读落点快照
+        cutover = cutover_svc.gate_batch_conn(conn, batch)
+        visit_codes = cutover_svc._parse_list(cutover["visit_codes"]) or [
+            "V1",
+            "V2",
+            "V3",
+            "EOT",
+        ]
         existing = conn.execute(
             "SELECT COUNT(*) AS c FROM visit_rows WHERE batch_id=?", (batch_id,)
         ).fetchone()["c"]
@@ -466,6 +477,7 @@ def ingest_ok_rows(batch_id: int, db_path: str | None = None) -> dict:
             raise ServiceError("访视批次不存在", 404)
         if batch["status"] == "已关闭":
             raise ServiceError("已关闭批次不能入库")
+        cutover_svc.gate_batch_conn(conn, batch)
         cur = conn.execute(
             """
             UPDATE visit_rows

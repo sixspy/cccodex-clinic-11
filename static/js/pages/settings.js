@@ -14,6 +14,7 @@ export async function renderSettings(el) {
         <div class="stat"><div class="n">${snapshot.qc_auto_scan || '-'}</div><div class="l">自动质控</div></div>
         <div class="stat"><div class="n">${snapshot.site_quota_warn || '-'}</div><div class="l">配额告警阈值</div></div>
         <div class="stat"><div class="n">${escapeHtml((snapshot.clinic_timezone || '-').slice(0, 12))}</div><div class="l">时区</div></div>
+        <div class="stat"><div class="n">${escapeHtml(snapshot.protocol_cutover_mode || '-')}</div><div class="l">协议切流口径（只读）</div></div>
       </div>
     </div>
     <div class="card">
@@ -25,8 +26,12 @@ export async function renderSettings(el) {
               <td><code>${escapeHtml(s.key)}</code></td>
               <td>${escapeHtml(s.label)}</td>
               <td><strong>${escapeHtml(s.value)}</strong></td>
-              <td><input data-key="${escapeHtml(s.key)}" value="${escapeHtml(s.value)}" /></td>
-              <td><button data-save="${escapeHtml(s.key)}">保存</button></td>
+              <td>${s.key === 'protocol_cutover_mode'
+                ? '<span class="muted">只读展示</span>'
+                : `<input data-key="${escapeHtml(s.key)}" value="${escapeHtml(s.value)}" />`}</td>
+              <td>${s.key === 'protocol_cutover_mode'
+                ? '<span class="muted">-</span>'
+                : `<button data-save="${escapeHtml(s.key)}">保存</button>`}</td>
             </tr>`).join('')}
         </tbody>
       </table>

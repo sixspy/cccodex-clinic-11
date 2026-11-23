@@ -4,6 +4,7 @@ import json
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import cutover as cutover_svc
 from app.services.errors import ServiceError
 
 SEVERITIES = ("提示", "一般", "严重")
@@ -117,19 +118,14 @@ def scan_batch(batch_id: int, db_path: str | None = None) -> dict:
         ).fetchone()
         if not batch:
             raise ServiceError("访视批次不存在", 404)
-        required = ["subject_key", "visit_code", "visit_date", "investigator"]
-        if batch["protocol_id"]:
-            proto = conn.execute(
-                "SELECT required_fields FROM protocols WHERE id=?",
-                (batch["protocol_id"],),
-            ).fetchone()
-            if proto:
-                try:
-                    parsed = json.loads(proto["required_fields"] or "[]")
-                    if isinstance(parsed, list) and parsed:
-                        required = [str(x) for x in parsed]
-                except json.JSONDecodeError:
-                    pass
+        # 切流闸：拦截按旧版扫描；必填字段只读落点快照
+        cutover = cutover_svc.gate_batch_conn(conn, batch)
+        required = cutover_svc._parse_list(cutover["required_fields"]) or [
+            "subject_key",
+            "visit_code",
+            "visit_date",
+            "investigator",
+        ]
         rows = conn.execute(
             """
             SELECT * FROM visit_rows
@@ -193,11 +189,18 @@ def scan_all_open(db_path: str | None = None) -> dict:
         ).fetchall()
     total = 0
     details = []
+    blocked = 0
     for b in batches:
-        result = scan_batch(b["id"], db_path=db_path)
+        try:
+            result = scan_batch(b["id"], db_path=db_path)
+        except ServiceError as exc:
+            # 切流闸拦截的批次不拖垮全量扫描，逐批讲明白
+            blocked += 1
+            details.append({"batch_id": b["id"], "created": 0, "blocked": exc.message})
+            continue
         total += result["created"]
         details.append({"batch_id": b["id"], "created": result["created"]})
-    return {"created": total, "batches": details}
+    return {"created": total, "blocked": blocked, "batches": details}
 
 
 def close_finding(finding_id: int, db_path: str | None = None) -> dict:

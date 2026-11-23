@@ -11,6 +11,7 @@ from app.config import Config
 from app.seed import seed_if_needed
 from app.services import audit as audit_svc
 from app.services import backfill as backfill_svc
+from app.services import cutover as cutover_svc
 from app.services import protocols as protocols_svc
 from app.services import qc as qc_svc
 from app.services import reconcile as reconcile_svc
@@ -409,6 +410,38 @@ class Api:
 
     @cherrypy.expose
     @_wrap
+    def cutovers(self, cutover_id=None):
+        _require()
+        method = cherrypy.request.method
+        q = _query()
+        if cutover_id is None:
+            if method == "GET":
+                site_id = int(q["site_id"]) if q.get("site_id") else None
+                return _json(
+                    {
+                        "mode": cutover_svc.MODE_LABEL,
+                        "items": cutover_svc.list_cutovers(
+                            site_id=site_id, status=q.get("status")
+                        ),
+                    }
+                )
+            if method == "POST":
+                body = _read_json()
+                return _json(
+                    cutover_svc.submit_cutover(
+                        int(body.get("site_id") or 0),
+                        int(body.get("protocol_id") or 0),
+                        body.get("expected_revision", 0),
+                        body.get("note", ""),
+                    )
+                )
+            return _json({"error": "方法不允许"}, 405)
+        if method == "GET":
+            return _json(cutover_svc.get_cutover(int(cutover_id)))
+        return _json({"error": "未知切流路由"}, 404)
+
+    @cherrypy.expose
+    @_wrap
     def reports(self, action=None):
         _require()
         method = cherrypy.request.method
@@ -509,6 +542,11 @@ class ApiMount:
             if len(parts) == 2:
                 return api.jobs(job_id=parts[1])
             return api.jobs(job_id=parts[1], action=parts[2])
+        if path == "/cutovers" or path.startswith("/cutovers/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 1:
+                return api.cutovers()
+            return api.cutovers(cutover_id=parts[1])
         if path == "/reports" or path.startswith("/reports/"):
             parts = path.strip("/").split("/")
             if len(parts) == 1:

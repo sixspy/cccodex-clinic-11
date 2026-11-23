@@ -17,10 +17,11 @@ export async function renderVisits(el) {
   el.innerHTML = `
     <div class="card">
       <h2>访视清单抓取批次</h2>
-      <p class="muted">按试验中心开批次，模拟抓取访视行，合格行可入库，缺口行进入质控与补采。</p>
+      <p class="muted">按试验中心开批次，模拟抓取访视行，合格行可入库，缺口行进入质控与补采。
+        开批与抓取只认中心切流落点；批次版号与落点拧花即拦旧协议抓取。</p>
       <div class="row">
         <select id="siteId">${siteOpts}</select>
-        <select id="protocolId"><option value="">默认生效方案</option>${protoOpts}</select>
+        <select id="protocolId"><option value="">按中心切流落点（推荐）</option>${protoOpts}</select>
         <input id="bnote" placeholder="批次备注" />
         <button id="createBatch">开新批次</button>
       </div>
@@ -38,7 +39,7 @@ export async function renderVisits(el) {
       <table>
         <thead>
           <tr>
-            <th>批次编码</th><th>中心</th><th>方案</th><th>状态</th>
+            <th>批次编码</th><th>中心</th><th>方案@版号</th><th>切流对照</th><th>状态</th>
             <th>行数</th><th>缺口</th><th>备注</th><th>操作</th>
           </tr>
         </thead>
@@ -53,11 +54,15 @@ export async function renderVisits(el) {
     </div>`;
 
   function batchRow(b) {
+    const cutoverCell = b.cutover_state === '一致'
+      ? `${chip('一致')} <span class="muted">落点 ${escapeHtml(b.cutover_version || '')}</span>`
+      : `${chip(b.cutover_state || '无落点')} <span class="muted">落点 ${escapeHtml(b.cutover_version || '-')} r${b.cutover_revision ?? '-'}</span>`;
     return `
       <tr>
         <td>${escapeHtml(b.batch_code)}</td>
         <td>${escapeHtml(b.site_name || '')}</td>
         <td>${escapeHtml((b.protocol_code || '-') + (b.protocol_version ? '@' + b.protocol_version : ''))}</td>
+        <td>${cutoverCell}</td>
         <td>${chip(b.status)}</td>
         <td>${b.item_count}</td>
         <td>${b.gap_count}</td>
@@ -83,6 +88,12 @@ export async function renderVisits(el) {
         <strong>${escapeHtml(b.batch_code)}</strong>
         ${chip(b.status)}
         <span class="muted">${escapeHtml(b.site_name)} · 方案 ${escapeHtml(b.protocol_title || '-')}</span>
+      </div>
+      <div class="row">
+        <span class="muted">批次版号</span> <strong>${escapeHtml((b.protocol_code || '-') + (b.protocol_version ? '@' + b.protocol_version : ''))}</strong>
+        <span class="muted">切流落点</span> <strong>${b.cutover_code ? escapeHtml(b.cutover_code + '@' + b.cutover_version) : '无落点'}</strong>
+        ${chip(b.cutover_state || '无落点')}
+        <span class="muted">指纹${escapeHtml(String(b.cutover_fingerprint || '-').slice(0, 8))} · r${b.cutover_revision ?? '-'}</span>
       </div>
       <div class="grid">
         <div class="stat"><div class="n">${b.item_count}</div><div class="l">访视行</div></div>

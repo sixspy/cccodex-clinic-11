@@ -30,6 +30,27 @@ def dashboard(db_path: str | None = None) -> dict:
             """
         ).fetchone()["c"]
         audits = conn.execute("SELECT COUNT(*) AS c FROM audit_events").fetchone()["c"]
+        cutovers = conn.execute(
+            "SELECT COUNT(*) AS c FROM protocol_cutovers WHERE status='现行'"
+        ).fetchone()["c"]
+        no_cutover = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM trial_sites s
+            WHERE NOT EXISTS (
+              SELECT 1 FROM protocol_cutovers c
+              WHERE c.site_id=s.id AND c.status='现行'
+            )
+            """
+        ).fetchone()["c"]
+        mismatch = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM visit_batches b
+            JOIN protocol_cutovers c
+              ON c.site_id=b.site_id AND c.status='现行'
+            WHERE b.status!='已关闭'
+              AND (b.protocol_id IS NULL OR b.protocol_id != c.protocol_id)
+            """
+        ).fetchone()["c"]
         by_batch_status = conn.execute(
             """
             SELECT status, COUNT(*) AS c FROM visit_batches GROUP BY status
@@ -45,6 +66,9 @@ def dashboard(db_path: str | None = None) -> dict:
             "open_findings": findings,
             "pending_jobs": jobs,
             "audits": audits,
+            "cutovers": cutovers,
+            "no_cutover_sites": no_cutover,
+            "cutover_mismatch": mismatch,
             "batch_status": {r["status"]: r["c"] for r in by_batch_status},
         }
 

@@ -87,6 +87,25 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS protocol_cutovers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER NOT NULL REFERENCES trial_sites(id),
+  protocol_id INTEGER NOT NULL REFERENCES protocols(id),
+  protocol_code TEXT NOT NULL,
+  protocol_version TEXT NOT NULL,
+  required_fields TEXT NOT NULL DEFAULT '[]',
+  visit_codes TEXT NOT NULL DEFAULT '[]',
+  fingerprint TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL CHECK (status IN ('现行','封存')) DEFAULT '现行',
+  note TEXT NOT NULL DEFAULT '',
+  sealed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cutover_live
+  ON protocol_cutovers(site_id) WHERE status='现行';
+
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   actor TEXT NOT NULL DEFAULT 'admin',
